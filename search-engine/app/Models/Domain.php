@@ -14,6 +14,7 @@ class Domain extends Model
         'name',
         'base_url',
         'robots_txt',
+        'robots_checked',
         'crawl_delay_ms',
         'status',
         'max_depth',
@@ -22,6 +23,7 @@ class Domain extends Model
     ];
 
     protected $casts = [
+        'robots_checked' => 'boolean',
         'crawl_delay_ms' => 'integer',
         'max_depth' => 'integer',
         'pages_count' => 'integer',

@@ -23,6 +23,7 @@ class CrawlQueue extends Model
         'attempts',
         'max_attempts',
         'last_attempt_at',
+        'locked_by',
     ];
 
     protected $casts = [
@@ -41,6 +42,21 @@ class CrawlQueue extends Model
     public function scopePending(Builder $query): Builder
     {
         return $query->where('status', 'pending');
+    }
+
+    /**
+     * Pending items, plus "processing" items whose worker died without
+     * releasing the lock (stale for longer than the given number of minutes).
+     */
+    public function scopeClaimable(Builder $query, int $staleAfterMinutes = 10): Builder
+    {
+        return $query->where(function (Builder $q) use ($staleAfterMinutes) {
+            $q->where('status', 'pending')
+                ->orWhere(function (Builder $q2) use ($staleAfterMinutes) {
+                    $q2->where('status', 'processing')
+                        ->where('last_attempt_at', '<', now()->subMinutes($staleAfterMinutes));
+                });
+        });
     }
 
     public function scopeNextByPriority(Builder $query): Builder

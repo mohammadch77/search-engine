@@ -2,7 +2,9 @@
 
 namespace App\Services;
 
-use Illuminate\Support\Facades\Http;
+use GuzzleHttp\Client;
+use GuzzleHttp\Exception\GuzzleException;
+use Psr\Http\Message\ResponseInterface;
 
 class CrawlerService
 {
@@ -16,51 +18,146 @@ class CrawlerService
      */
     protected static array $lastRequestAt = [];
 
+    protected static ?Client $client = null;
+
     /**
-     * Fetch a URL and return response details.
-     *
-     * @return array{status: ?int, body: ?string, headers: array, response_time_ms: ?int, content_type: ?string, error: ?string}
+     * A single, process-wide Guzzle client with a keep-alive curl handle so
+     * repeated requests to the same host reuse the underlying TCP connection.
      */
-    public function fetch(string $url, int $crawlDelayMs = 1000): array
+    protected function client(): Client
     {
+        return self::$client ??= new Client([
+            'curl' => [
+                CURLOPT_TCP_KEEPALIVE => 1,
+                CURLOPT_TCP_KEEPIDLE => 120,
+                CURLOPT_FORBID_REUSE => false,
+                CURLOPT_FRESH_CONNECT => false,
+            ],
+            'headers' => [
+                'User-Agent' => self::USER_AGENT,
+                'Accept' => 'text/html,application/xhtml+xml,*/*;q=0.8',
+            ],
+            'allow_redirects' => ['max' => 5],
+        ]);
+    }
+
+    /**
+     * Fetch a URL, checking the Content-Type before downloading the body and
+     * aborting the download if it exceeds $maxBodyBytes.
+     *
+     * @return array{status: ?int, body: ?string, response_time_ms: ?int, content_type: ?string, error: ?string, skipped_reason: ?string}
+     */
+    public function fetch(string $url, int $crawlDelayMs = 500, ?int $maxBodyBytes = null): array
+    {
+        $maxBodyBytes ??= config('crawler.max_body_bytes', 2 * 1024 * 1024);
+
         $this->waitForCrawlDelay($url, $crawlDelayMs);
 
         $start = microtime(true);
 
         try {
-            $response = Http::withHeaders([
-                'User-Agent' => self::USER_AGENT,
-                'Accept' => 'text/html,application/xhtml+xml,*/*;q=0.8',
-            ])
-                ->timeout(30)
-                ->connectTimeout(10)
-                ->withOptions(['allow_redirects' => ['max' => 5]])
-                ->get($url);
+            $response = $this->client()->request('GET', $url, [
+                'stream' => true,
+                'timeout' => config('crawler.timeout', 15),
+                'connect_timeout' => config('crawler.connect_timeout', 5),
+            ]);
 
-            $responseTimeMs = (int) round((microtime(true) - $start) * 1000);
+            $responseTimeMs = fn () => (int) round((microtime(true) - $start) * 1000);
+            $contentType = $response->getHeaderLine('Content-Type');
+
+            if ($contentType !== '' && ! $this->isAllowedContentType($contentType)) {
+                return [
+                    'status' => $response->getStatusCode(),
+                    'body' => null,
+                    'response_time_ms' => $responseTimeMs(),
+                    'content_type' => $contentType,
+                    'error' => null,
+                    'skipped_reason' => 'non_html_content_type',
+                ];
+            }
+
+            $declaredLength = (int) $response->getHeaderLine('Content-Length');
+            if ($declaredLength > 0 && $declaredLength > $maxBodyBytes) {
+                return [
+                    'status' => $response->getStatusCode(),
+                    'body' => null,
+                    'response_time_ms' => $responseTimeMs(),
+                    'content_type' => $contentType,
+                    'error' => null,
+                    'skipped_reason' => 'too_large',
+                ];
+            }
+
+            [$body, $tooLarge] = $this->readBodyLimited($response, $maxBodyBytes);
+
+            if ($tooLarge) {
+                return [
+                    'status' => $response->getStatusCode(),
+                    'body' => null,
+                    'response_time_ms' => $responseTimeMs(),
+                    'content_type' => $contentType,
+                    'error' => null,
+                    'skipped_reason' => 'too_large',
+                ];
+            }
 
             return [
-                'status' => $response->status(),
-                'body' => $response->body(),
-                'headers' => $response->headers(),
-                'response_time_ms' => $responseTimeMs,
-                'content_type' => $response->header('Content-Type'),
+                'status' => $response->getStatusCode(),
+                'body' => $body,
+                'response_time_ms' => $responseTimeMs(),
+                'content_type' => $contentType ?: null,
                 'error' => null,
+                'skipped_reason' => null,
             ];
-        } catch (\Throwable $e) {
-            $responseTimeMs = (int) round((microtime(true) - $start) * 1000);
-
+        } catch (GuzzleException|\Throwable $e) {
             return [
                 'status' => null,
                 'body' => null,
-                'headers' => [],
-                'response_time_ms' => $responseTimeMs,
+                'response_time_ms' => (int) round((microtime(true) - $start) * 1000),
                 'content_type' => null,
                 'error' => $e->getMessage(),
+                'skipped_reason' => null,
             ];
         } finally {
             self::$lastRequestAt[$this->hostFor($url)] = microtime(true);
         }
+    }
+
+    protected function isAllowedContentType(string $contentType): bool
+    {
+        foreach (config('crawler.allowed_content_types', ['text/html']) as $allowed) {
+            if (str_contains($contentType, $allowed)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * Read the response body up to $maxBytes, aborting the connection if the
+     * limit is exceeded (handles chunked responses with no Content-Length).
+     *
+     * @return array{0: ?string, 1: bool} [body, exceededLimit]
+     */
+    protected function readBodyLimited(ResponseInterface $response, int $maxBytes): array
+    {
+        $stream = $response->getBody();
+        $buffer = '';
+
+        while (! $stream->eof()) {
+            $buffer .= $stream->read(8192);
+
+            if (strlen($buffer) > $maxBytes) {
+                $stream->close();
+
+                return [null, true];
+            }
+        }
+
+        $stream->close();
+
+        return [$buffer, false];
     }
 
     protected function waitForCrawlDelay(string $url, int $crawlDelayMs): void
