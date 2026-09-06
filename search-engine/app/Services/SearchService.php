@@ -66,6 +66,10 @@ class SearchService
                 ->get();
 
             $ranked = $this->rankingService->rank($candidates, $normalized);
+
+            if (($filters['sort'] ?? 'relevance') === 'date') {
+                $ranked = $ranked->sortByDesc(fn (Page $page) => $page->crawled_at)->values();
+            }
         }
 
         $lastPage = $perPage > 0 ? max(1, (int) ceil(min($total, self::MAX_CANDIDATES) / $perPage)) : 1;

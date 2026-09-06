@@ -17,11 +17,12 @@ class SnippetGenerator
         $keywords = $this->extractKeywords($query);
 
         if (empty($keywords)) {
-            return $this->truncate($content, $length);
+            return htmlspecialchars($this->truncate($content, $length), ENT_QUOTES, 'UTF-8');
         }
 
         $bestPosition = $this->findBestPosition($content, $keywords);
         $snippet = $this->extractAround($content, $bestPosition, $length);
+        $snippet = htmlspecialchars($snippet, ENT_QUOTES, 'UTF-8');
 
         return $this->highlight($snippet, $keywords);
     }
