@@ -3,6 +3,7 @@
 namespace App\Console\Commands;
 
 use App\Services\CrawlManager;
+use App\Services\UrlNormalizer;
 use Illuminate\Console\Command;
 
 class CrawlAdd extends Command
@@ -11,7 +12,7 @@ class CrawlAdd extends Command
 
     protected $description = 'Add a domain and its first URL to the crawl queue';
 
-    public function handle(CrawlManager $manager): int
+    public function handle(CrawlManager $manager, UrlNormalizer $normalizer): int
     {
         $url = $this->argument('url');
 
@@ -20,6 +21,8 @@ class CrawlAdd extends Command
 
             return self::FAILURE;
         }
+
+        $url = $normalizer->normalize($url);
 
         $domain = $manager->addDomain($url);
 

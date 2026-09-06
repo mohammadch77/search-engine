@@ -9,7 +9,7 @@ use Psr\Http\Message\ResponseInterface;
 
 class CrawlerService
 {
-    public const USER_AGENT = 'SearchEngineBot/1.0 (+https://example.com/bot)';
+    public const USER_AGENT = 'SearchEngineBot/1.0 (+https://github.com/mohammadch77/search-engine)';
 
     /**
      * In-memory record of the last request time per domain host, used to
@@ -231,8 +231,13 @@ class CrawlerService
             return;
         }
 
+        // ±20% jitter so many workers hitting the same host don't fall into
+        // lockstep request timing.
+        $jitter = 1 + (mt_rand(-20, 20) / 100);
+        $delayWithJitter = $crawlDelayMs * $jitter;
+
         $elapsedMs = (microtime(true) - $last) * 1000;
-        $remainingMs = $crawlDelayMs - $elapsedMs;
+        $remainingMs = $delayWithJitter - $elapsedMs;
 
         if ($remainingMs > 0) {
             usleep((int) ($remainingMs * 1000));

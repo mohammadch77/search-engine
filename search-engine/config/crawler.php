@@ -34,4 +34,17 @@ return [
 
     // Hard cap on total domains, to keep organic growth bounded.
     'max_domains' => (int) env('CRAWLER_MAX_DOMAINS', 5000),
+
+    // Hard cap on queued+crawled URLs per domain, so one large site can't
+    // fill the entire queue and starve other domains.
+    'max_urls_per_domain' => (int) env('CRAWLER_MAX_URLS_PER_DOMAIN', 10000),
+
+    // Max URLs from the same domain claimed into one concurrent fetch batch.
+    'max_concurrent_per_domain' => (int) env('CRAWLER_MAX_CONCURRENT_PER_DOMAIN', 2),
+
+    // Minimum crawl-log samples for a domain before its error rate is judged.
+    'error_rate_sample_size' => (int) env('CRAWLER_ERROR_RATE_SAMPLE_SIZE', 20),
+
+    // Auto-pause a domain once its recent error rate exceeds this fraction.
+    'error_rate_pause_threshold' => (float) env('CRAWLER_ERROR_RATE_PAUSE_THRESHOLD', 0.5),
 ];

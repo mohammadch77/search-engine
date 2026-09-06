@@ -14,10 +14,21 @@ use Illuminate\Support\Facades\Log;
 
 class CrawlManager
 {
+    /**
+     * Common phrases found on "soft 404" pages — real HTTP 200 responses
+     * whose content is actually a generic not-found/error page.
+     */
+    protected const SOFT_404_PHRASES = [
+        'صفحه مورد نظر یافت نشد', 'صفحه یافت نشد', 'یافت نشد',
+        'page not found', 'not found', '404 error', 'page does not exist',
+        'this page doesn\'t exist', 'content not found',
+    ];
+
     public function __construct(
         protected CrawlerService $crawler,
         protected HtmlParser $parser,
         protected RobotsTxtParser $robots,
+        protected UrlNormalizer $normalizer,
     ) {
     }
 
@@ -28,6 +39,7 @@ class CrawlManager
      */
     public function addDomain(string $url, int $priority = 10, bool $fetchRobots = true): Domain
     {
+        $url = $this->normalizer->normalize($url);
         $host = parse_url($url, PHP_URL_HOST);
 
         if (! $host) {
@@ -79,10 +91,16 @@ class CrawlManager
      * Atomically claim and return the next pending queue item, or null if
      * none is available. Safe for many worker processes to call concurrently.
      */
-    public function claimNext(string $workerId): ?CrawlQueue
+    public function claimNext(string $workerId, array $excludeIds = []): ?CrawlQueue
     {
-        return DB::transaction(function () use ($workerId) {
-            $item = CrawlQueue::claimable()->nextByPriority()->lock('for update skip locked')->first();
+        return DB::transaction(function () use ($workerId, $excludeIds) {
+            $query = CrawlQueue::claimable()->nextByPriority();
+
+            if ($excludeIds !== []) {
+                $query->whereNotIn('id', $excludeIds);
+            }
+
+            $item = $query->lock('for update skip locked')->first();
 
             if (! $item) {
                 return null;
@@ -101,11 +119,24 @@ class CrawlManager
 
     protected function enqueueUrl(Domain $domain, string $url, int $depth, int $priority = 0): void
     {
+        $url = $this->normalizer->normalize($url);
+
+        if (! $this->normalizer->shouldCrawl($url) || $this->normalizer->isTrap($url)) {
+            return;
+        }
+
         $urlHash = hash('sha256', $url);
 
         if (Page::where('url_hash', $urlHash)->exists()) {
             return;
         }
+
+        $maxUrlsPerDomain = config('crawler.max_urls_per_domain', 10000);
+        if ($maxUrlsPerDomain > 0 && CrawlQueue::where('domain_id', $domain->id)->count() >= $maxUrlsPerDomain) {
+            return;
+        }
+
+        $priority += $this->priorityBoost($url, $depth);
 
         // insertOrIgnore silently skips the row if url_hash already exists
         // (unique index) instead of throwing a duplicate-key exception —
@@ -122,6 +153,18 @@ class CrawlManager
             'created_at' => now(),
             'updated_at' => now(),
         ]]);
+    }
+
+    /**
+     * Shorter URLs and shallower pages are usually more important (closer to
+     * the homepage, less likely to be deep noise) so nudge their priority up.
+     */
+    protected function priorityBoost(string $url, int $depth): int
+    {
+        $depthBoost = max(0, 5 - $depth);
+        $lengthBoost = strlen($url) < 60 ? 2 : (strlen($url) < 120 ? 1 : 0);
+
+        return $depthBoost + $lengthBoost;
     }
 
     /**
@@ -179,14 +222,29 @@ class CrawlManager
     public function claimBatch(string $workerId, int $batchSize): array
     {
         $items = [];
+        $domainCounts = [];
+        $excludeIds = [];
+        $maxPerDomain = config('crawler.max_concurrent_per_domain', 2);
 
-        for ($i = 0; $i < $batchSize; $i++) {
-            $item = $this->claimNext($workerId);
+        // Bound total attempts so a queue dominated by one already-saturated
+        // domain can't spin forever trying (and skipping) its own URLs.
+        $maxAttempts = $batchSize * 5;
+
+        for ($i = 0; count($items) < $batchSize && $i < $maxAttempts; $i++) {
+            $item = $this->claimNext($workerId, $excludeIds);
 
             if (! $item) {
                 break;
             }
 
+            if (($domainCounts[$item->domain_id] ?? 0) >= $maxPerDomain) {
+                $item->update(['status' => 'pending', 'locked_by' => null]);
+                $excludeIds[] = $item->id;
+
+                continue;
+            }
+
+            $domainCounts[$item->domain_id] = ($domainCounts[$item->domain_id] ?? 0) + 1;
             $items[] = $item;
         }
 
@@ -302,7 +360,25 @@ class CrawlManager
             return true;
         }
 
-        $page = $this->savePage($domain, $item, $result, $parsed);
+        if ($this->isSoft404($parsed)) {
+            $item->update(['status' => 'done', 'locked_by' => null]);
+            $this->log($domain, null, $item->url, $result['status'], $result['response_time_ms'], null, 'Skipped: soft 404');
+
+            return true;
+        }
+
+        $contentHash = hash('sha256', $parsed['content_text']);
+        $urlHash = $item->url_hash;
+        $duplicate = Page::where('content_hash', $contentHash)->where('url_hash', '!=', $urlHash)->exists();
+
+        if ($duplicate) {
+            $item->update(['status' => 'done', 'locked_by' => null]);
+            $this->log($domain, null, $item->url, $result['status'], $result['response_time_ms'], null, 'Skipped: duplicate content');
+
+            return true;
+        }
+
+        $page = $this->savePage($domain, $item, $result, $parsed, $contentHash);
 
         $this->saveLinks($domain, $page, $item, $parsed['links']);
 
@@ -338,13 +414,57 @@ class CrawlManager
 
         $this->log($domain, null, $item->url, $result['status'], $result['response_time_ms'], null, $result['error'] ?? "HTTP {$result['status']}");
 
+        $this->maybeAutoPause($domain);
+
         return false;
     }
 
-    protected function savePage(Domain $domain, CrawlQueue $item, array $result, array $parsed): Page
+    /**
+     * Pause a domain whose recent crawl attempts are mostly failing, so a
+     * broken or blocking site doesn't keep burning worker time.
+     */
+    protected function maybeAutoPause(Domain $domain): void
+    {
+        $sampleSize = config('crawler.error_rate_sample_size', 20);
+
+        $recent = CrawlLog::where('domain_id', $domain->id)
+            ->orderByDesc('id')
+            ->limit($sampleSize)
+            ->pluck('error_message');
+
+        if ($recent->count() < $sampleSize) {
+            return;
+        }
+
+        $errorRate = $recent->filter(fn ($error) => $error !== null)->count() / $recent->count();
+        $threshold = config('crawler.error_rate_pause_threshold', 0.5);
+
+        if ($errorRate > $threshold && $domain->status === 'active') {
+            $domain->update(['status' => 'paused']);
+            Log::warning("Auto-paused domain {$domain->name} (id: {$domain->id}): error rate ".round($errorRate * 100)."% over last {$sampleSize} attempts");
+        }
+    }
+
+    /**
+     * True if the fetched page returns HTTP 200 but its content is actually a
+     * generic "not found" page — a common cause of wasted crawl/index space.
+     */
+    protected function isSoft404(array $parsed): bool
+    {
+        $haystack = mb_strtolower(($parsed['title'] ?? '').' '.mb_substr($parsed['content_text'] ?? '', 0, 500));
+
+        foreach (self::SOFT_404_PHRASES as $phrase) {
+            if (mb_strpos($haystack, mb_strtolower($phrase)) !== false) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    protected function savePage(Domain $domain, CrawlQueue $item, array $result, array $parsed, string $contentHash): Page
     {
         $urlHash = $item->url_hash;
-        $contentHash = hash('sha256', $parsed['content_text']);
 
         return Page::updateOrCreate(
             ['url_hash' => $urlHash],

@@ -7,6 +7,11 @@ use DOMXPath;
 
 class HtmlParser
 {
+    public function __construct(
+        protected UrlNormalizer $normalizer = new UrlNormalizer(),
+    ) {
+    }
+
     /**
      * Parse raw HTML into structured data.
      *
@@ -164,6 +169,10 @@ class HtmlParser
                 continue;
             }
 
+            if (! $this->normalizer->shouldCrawl($absolute) || $this->normalizer->isTrap($absolute)) {
+                continue;
+            }
+
             $seen[$absolute] = true;
 
             $links[] = [
@@ -227,20 +236,6 @@ class HtmlParser
 
     protected function normalize(string $url): string
     {
-        $parts = parse_url($url);
-        if ($parts === false) {
-            return $url;
-        }
-
-        $fragment = '';
-        unset($parts['fragment']);
-
-        $scheme = $parts['scheme'] ?? 'http';
-        $host = $parts['host'] ?? '';
-        $port = isset($parts['port']) ? ':'.$parts['port'] : '';
-        $path = $parts['path'] ?? '/';
-        $query = isset($parts['query']) ? '?'.$parts['query'] : '';
-
-        return strtolower($scheme).'://'.strtolower($host).$port.($path ?: '/').$query;
+        return $this->normalizer->normalize($url);
     }
 }

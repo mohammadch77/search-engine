@@ -1,0 +1,18 @@
+{
+    "version": "0.0.1",
+    "configurations": [
+        {
+            "name": "laravel",
+            "runtimeExecutable": "php",
+            "runtimeArgs": ["-r", "chdir('search-engine'); passthru('php artisan serve --port=' . getenv('PORT'));"],
+            "port": 8001,
+            "autoPort": true
+        },
+        {
+            "name": "vite",
+            "runtimeExecutable": "npm",
+            "runtimeArgs": ["--prefix", "search-engine", "run", "dev", "--", "--port=5173"],
+            "port": 5173
+        }
+    ]
+}
