@@ -6,6 +6,7 @@ use App\Models\Domain;
 use App\Services\SearchService;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Cache;
 
 class SearchController extends Controller
 {
@@ -53,11 +54,19 @@ class SearchController extends Controller
 
     public function domains(): JsonResponse
     {
+        $fetch = fn () => Domain::query()
+            ->where('pages_count', '>', 0)
+            ->orderBy('name')
+            ->pluck('name');
+
+        try {
+            $domains = Cache::store('redis')->remember('search:domains', 300, $fetch);
+        } catch (\Throwable $e) {
+            $domains = $fetch();
+        }
+
         return response()->json([
-            'domains' => Domain::query()
-                ->where('pages_count', '>', 0)
-                ->orderBy('name')
-                ->pluck('name'),
+            'domains' => $domains,
         ]);
     }
 }

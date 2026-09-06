@@ -4,6 +4,7 @@ namespace App\Services;
 
 use App\Models\Page;
 use App\Models\SearchLog;
+use Illuminate\Support\Facades\Cache;
 
 class SearchService
 {
@@ -26,6 +27,17 @@ class SearchService
     public function search(string $query, array $filters = [], int $page = 1, int $perPage = 10): array
     {
         $start = microtime(true);
+
+        $cacheKey = 'search:results:'.md5(json_encode([$query, $filters, $page, $perPage]));
+
+        $cached = $this->cacheGet($cacheKey);
+
+        if ($cached !== null) {
+            $timeTakenMs = (int) round((microtime(true) - $start) * 1000);
+            $this->logSearch($query, $cached['total'], $timeTakenMs);
+
+            return array_merge($cached, ['time_taken_ms' => $timeTakenMs]);
+        }
 
         $normalized = $this->normalizePersian($query);
         $booleanQuery = $this->prepareQuery($normalized);
@@ -93,7 +105,7 @@ class SearchService
 
         $this->logSearch($query, $total, $timeTakenMs);
 
-        return [
+        $result = [
             'results' => $items,
             'total' => $total,
             'page' => $page,
@@ -101,6 +113,33 @@ class SearchService
             'last_page' => $lastPage,
             'time_taken_ms' => $timeTakenMs,
         ];
+
+        $this->cachePut($cacheKey, $result);
+
+        return $result;
+    }
+
+    /**
+     * Cache lookups are best-effort: if the configured cache store is
+     * unreachable (e.g. Redis down in local dev), search still works,
+     * just without the 5-minute result cache.
+     */
+    protected function cacheGet(string $key): ?array
+    {
+        try {
+            return Cache::store('redis')->tags(['search-results'])->get($key);
+        } catch (\Throwable $e) {
+            return null;
+        }
+    }
+
+    protected function cachePut(string $key, array $value): void
+    {
+        try {
+            Cache::store('redis')->tags(['search-results'])->put($key, $value, 300);
+        } catch (\Throwable $e) {
+            // Ignore — caching is an optimization, not a requirement.
+        }
     }
 
     public function suggest(string $query, int $limit = 5): array

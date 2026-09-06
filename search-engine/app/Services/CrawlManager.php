@@ -8,6 +8,7 @@ use App\Models\Domain;
 use App\Models\Link;
 use App\Models\Page;
 use Illuminate\Database\QueryException;
+use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
 
@@ -312,7 +313,22 @@ class CrawlManager
 
         $this->log($domain, $page, $item->url, $result['status'], $result['response_time_ms'], strlen($result['body'] ?? ''), null);
 
+        $this->invalidateSearchCaches();
+
         return true;
+    }
+
+    protected function invalidateSearchCaches(): void
+    {
+        try {
+            $redis = Cache::store('redis');
+            $redis->tags(['search-results'])->flush();
+            $redis->forget('search:domains');
+            $redis->forget('admin:dashboard:stats');
+            $redis->forget('admin:dashboard:pages_per_day');
+        } catch (\Throwable $e) {
+            // Cache store unreachable (e.g. Redis down in local dev); safe to ignore.
+        }
     }
 
     protected function handleFailure(CrawlQueue $item, Domain $domain, array $result): bool
