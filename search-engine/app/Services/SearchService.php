@@ -4,13 +4,20 @@ namespace App\Services;
 
 use App\Models\Page;
 use App\Models\SearchLog;
-use Illuminate\Pagination\LengthAwarePaginator;
-use Illuminate\Support\Facades\DB;
 
 class SearchService
 {
-    public function __construct(protected SnippetGenerator $snippetGenerator)
-    {
+    /**
+     * Max candidate rows pulled from the FULLTEXT query before re-ranking
+     * and paginating in PHP. Keeps ranking accurate without loading the
+     * entire result set for popular queries.
+     */
+    protected const MAX_CANDIDATES = 200;
+
+    public function __construct(
+        protected SnippetGenerator $snippetGenerator,
+        protected RankingService $rankingService
+    ) {
     }
 
     /**
@@ -23,8 +30,8 @@ class SearchService
         $normalized = $this->normalizePersian($query);
         $booleanQuery = $this->prepareQuery($normalized);
 
-        $results = new LengthAwarePaginator([], 0, $perPage, $page);
-        $rows = collect();
+        $total = 0;
+        $ranked = collect();
 
         if ($booleanQuery !== '') {
             $builder = Page::query()
@@ -50,13 +57,22 @@ class SearchService
                 $builder->whereDate('crawled_at', '<=', $filters['to']);
             }
 
-            $builder->orderByDesc('relevance');
+            $countBuilder = clone $builder;
+            $total = $countBuilder->reorder()->count();
 
-            $results = $builder->with('domain')->paginate($perPage, ['*'], 'page', $page);
-            $rows = $results->getCollection();
+            $candidates = $builder->with('domain')
+                ->orderByDesc('relevance')
+                ->limit(self::MAX_CANDIDATES)
+                ->get();
+
+            $ranked = $this->rankingService->rank($candidates, $normalized);
         }
 
-        $items = $rows->map(function (Page $page) use ($normalized) {
+        $lastPage = $perPage > 0 ? max(1, (int) ceil(min($total, self::MAX_CANDIDATES) / $perPage)) : 1;
+        $page = max(1, $page);
+        $pageItems = $ranked->slice(($page - 1) * $perPage, $perPage)->values();
+
+        $items = $pageItems->map(function (Page $page) use ($normalized) {
             return [
                 'title' => $page->title ?: $page->url,
                 'url' => $page->url,
@@ -65,19 +81,20 @@ class SearchService
                 'language' => $page->language,
                 'crawled_at' => $page->crawled_at?->toIso8601String(),
                 'relevance' => (float) $page->relevance,
+                'score' => (float) $page->score,
             ];
         })->values();
 
         $timeTakenMs = (int) round((microtime(true) - $start) * 1000);
 
-        $this->logSearch($query, $results->total(), $timeTakenMs);
+        $this->logSearch($query, $total, $timeTakenMs);
 
         return [
             'results' => $items,
-            'total' => $results->total(),
-            'page' => $results->currentPage(),
-            'per_page' => $results->perPage(),
-            'last_page' => $results->lastPage(),
+            'total' => $total,
+            'page' => $page,
+            'per_page' => $perPage,
+            'last_page' => $lastPage,
             'time_taken_ms' => $timeTakenMs,
         ];
     }
