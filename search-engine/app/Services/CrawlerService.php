@@ -4,6 +4,7 @@ namespace App\Services;
 
 use GuzzleHttp\Client;
 use GuzzleHttp\Exception\GuzzleException;
+use GuzzleHttp\Pool;
 use Psr\Http\Message\ResponseInterface;
 
 class CrawlerService
@@ -47,7 +48,7 @@ class CrawlerService
      *
      * @return array{status: ?int, body: ?string, response_time_ms: ?int, content_type: ?string, error: ?string, skipped_reason: ?string}
      */
-    public function fetch(string $url, int $crawlDelayMs = 500, ?int $maxBodyBytes = null): array
+    public function fetch(string $url, int $crawlDelayMs = 200, ?int $maxBodyBytes = null): array
     {
         $maxBodyBytes ??= config('crawler.max_body_bytes', 2 * 1024 * 1024);
 
@@ -58,57 +59,11 @@ class CrawlerService
         try {
             $response = $this->client()->request('GET', $url, [
                 'stream' => true,
-                'timeout' => config('crawler.timeout', 15),
+                'timeout' => config('crawler.timeout', 10),
                 'connect_timeout' => config('crawler.connect_timeout', 5),
             ]);
 
-            $responseTimeMs = fn () => (int) round((microtime(true) - $start) * 1000);
-            $contentType = $response->getHeaderLine('Content-Type');
-
-            if ($contentType !== '' && ! $this->isAllowedContentType($contentType)) {
-                return [
-                    'status' => $response->getStatusCode(),
-                    'body' => null,
-                    'response_time_ms' => $responseTimeMs(),
-                    'content_type' => $contentType,
-                    'error' => null,
-                    'skipped_reason' => 'non_html_content_type',
-                ];
-            }
-
-            $declaredLength = (int) $response->getHeaderLine('Content-Length');
-            if ($declaredLength > 0 && $declaredLength > $maxBodyBytes) {
-                return [
-                    'status' => $response->getStatusCode(),
-                    'body' => null,
-                    'response_time_ms' => $responseTimeMs(),
-                    'content_type' => $contentType,
-                    'error' => null,
-                    'skipped_reason' => 'too_large',
-                ];
-            }
-
-            [$body, $tooLarge] = $this->readBodyLimited($response, $maxBodyBytes);
-
-            if ($tooLarge) {
-                return [
-                    'status' => $response->getStatusCode(),
-                    'body' => null,
-                    'response_time_ms' => $responseTimeMs(),
-                    'content_type' => $contentType,
-                    'error' => null,
-                    'skipped_reason' => 'too_large',
-                ];
-            }
-
-            return [
-                'status' => $response->getStatusCode(),
-                'body' => $body,
-                'response_time_ms' => $responseTimeMs(),
-                'content_type' => $contentType ?: null,
-                'error' => null,
-                'skipped_reason' => null,
-            ];
+            return $this->buildResult($response, $start, $maxBodyBytes);
         } catch (GuzzleException|\Throwable $e) {
             return [
                 'status' => null,
@@ -121,6 +76,113 @@ class CrawlerService
         } finally {
             self::$lastRequestAt[$this->hostFor($url)] = microtime(true);
         }
+    }
+
+    /**
+     * Fetch several URLs concurrently (bounded by $concurrency) using a Guzzle
+     * Pool. Crawl-delay is still enforced per host before each request starts.
+     *
+     * @param  array<string, int>  $urlDelayPairs  url => crawl delay in ms
+     * @return array<string, array{status: ?int, body: ?string, response_time_ms: ?int, content_type: ?string, error: ?string, skipped_reason: ?string}>
+     */
+    public function fetchConcurrently(array $urlDelayPairs, ?int $concurrency = null, ?int $maxBodyBytes = null): array
+    {
+        $concurrency ??= config('crawler.fetch_concurrency', 5);
+        $maxBodyBytes ??= config('crawler.max_body_bytes', 2 * 1024 * 1024);
+
+        $results = [];
+        $starts = [];
+        $client = $this->client();
+
+        $requests = function () use ($urlDelayPairs, $client, &$starts) {
+            foreach ($urlDelayPairs as $url => $crawlDelayMs) {
+                $this->waitForCrawlDelay($url, $crawlDelayMs);
+                $starts[$url] = microtime(true);
+
+                yield $url => fn () => $client->requestAsync('GET', $url, [
+                    'stream' => true,
+                    'timeout' => config('crawler.timeout', 10),
+                    'connect_timeout' => config('crawler.connect_timeout', 5),
+                ]);
+            }
+        };
+
+        $pool = new Pool($client, $requests(), [
+            'concurrency' => $concurrency,
+            'fulfilled' => function (ResponseInterface $response, string $url) use (&$results, &$starts, $maxBodyBytes) {
+                $results[$url] = $this->buildResult($response, $starts[$url], $maxBodyBytes);
+                self::$lastRequestAt[$this->hostFor($url)] = microtime(true);
+            },
+            'rejected' => function ($reason, string $url) use (&$results, &$starts) {
+                $results[$url] = [
+                    'status' => null,
+                    'body' => null,
+                    'response_time_ms' => (int) round((microtime(true) - ($starts[$url] ?? microtime(true))) * 1000),
+                    'content_type' => null,
+                    'error' => $reason instanceof \Throwable ? $reason->getMessage() : (string) $reason,
+                    'skipped_reason' => null,
+                ];
+                self::$lastRequestAt[$this->hostFor($url)] = microtime(true);
+            },
+        ]);
+
+        $pool->promise()->wait();
+
+        return $results;
+    }
+
+    /**
+     * @return array{status: ?int, body: ?string, response_time_ms: ?int, content_type: ?string, error: ?string, skipped_reason: ?string}
+     */
+    protected function buildResult(ResponseInterface $response, float $start, int $maxBodyBytes): array
+    {
+        $responseTimeMs = (int) round((microtime(true) - $start) * 1000);
+        $contentType = $response->getHeaderLine('Content-Type');
+
+        if ($contentType !== '' && ! $this->isAllowedContentType($contentType)) {
+            return [
+                'status' => $response->getStatusCode(),
+                'body' => null,
+                'response_time_ms' => $responseTimeMs,
+                'content_type' => $contentType,
+                'error' => null,
+                'skipped_reason' => 'non_html_content_type',
+            ];
+        }
+
+        $declaredLength = (int) $response->getHeaderLine('Content-Length');
+        if ($declaredLength > 0 && $declaredLength > $maxBodyBytes) {
+            return [
+                'status' => $response->getStatusCode(),
+                'body' => null,
+                'response_time_ms' => $responseTimeMs,
+                'content_type' => $contentType,
+                'error' => null,
+                'skipped_reason' => 'too_large',
+            ];
+        }
+
+        [$body, $tooLarge] = $this->readBodyLimited($response, $maxBodyBytes);
+
+        if ($tooLarge) {
+            return [
+                'status' => $response->getStatusCode(),
+                'body' => null,
+                'response_time_ms' => $responseTimeMs,
+                'content_type' => $contentType,
+                'error' => null,
+                'skipped_reason' => 'too_large',
+            ];
+        }
+
+        return [
+            'status' => $response->getStatusCode(),
+            'body' => $body,
+            'response_time_ms' => $responseTimeMs,
+            'content_type' => $contentType ?: null,
+            'error' => null,
+            'skipped_reason' => null,
+        ];
     }
 
     protected function isAllowedContentType(string $contentType): bool

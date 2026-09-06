@@ -2,16 +2,22 @@
 
 return [
     // Number of parallel worker processes spawned by `crawl:mass` by default.
-    'workers' => (int) env('CRAWLER_WORKERS', 8),
+    'workers' => (int) env('CRAWLER_WORKERS', 15),
 
     // Used for new domains that don't specify a crawl-delay via robots.txt.
-    'crawl_delay_ms' => (int) env('CRAWLER_CRAWL_DELAY_MS', 500),
+    'crawl_delay_ms' => (int) env('CRAWLER_CRAWL_DELAY_MS', 200),
 
     // Used for new domains.
     'max_depth' => (int) env('CRAWLER_MAX_DEPTH', 10),
 
-    'timeout' => (int) env('CRAWLER_TIMEOUT', 15),
+    'timeout' => (int) env('CRAWLER_TIMEOUT', 10),
     'connect_timeout' => (int) env('CRAWLER_CONNECT_TIMEOUT', 5),
+
+    // Number of URLs each worker fetches concurrently via Guzzle Pool.
+    'fetch_concurrency' => (int) env('CRAWLER_FETCH_CONCURRENCY', 5),
+
+    // Pages with less extracted text than this are skipped (not saved/parsed further).
+    'min_content_chars' => (int) env('CRAWLER_MIN_CONTENT_CHARS', 100),
 
     // Pages larger than this (bytes) are skipped without being fully downloaded.
     'max_body_bytes' => (int) env('CRAWLER_MAX_BODY_BYTES', 2 * 1024 * 1024),

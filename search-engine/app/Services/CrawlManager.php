@@ -43,7 +43,7 @@ class CrawlManager
                     'base_url' => $baseUrl,
                     'status' => 'active',
                     'max_depth' => config('crawler.max_depth', 10),
-                    'crawl_delay_ms' => config('crawler.crawl_delay_ms', 500),
+                    'crawl_delay_ms' => config('crawler.crawl_delay_ms', 200),
                 ]
             );
         } catch (QueryException $e) {
@@ -98,26 +98,29 @@ class CrawlManager
         });
     }
 
-    protected function enqueueUrl(Domain $domain, string $url, int $depth, int $priority = 0): ?CrawlQueue
+    protected function enqueueUrl(Domain $domain, string $url, int $depth, int $priority = 0): void
     {
         $urlHash = hash('sha256', $url);
 
-        if (CrawlQueue::where('url_hash', $urlHash)->exists()) {
-            return null;
-        }
-
         if (Page::where('url_hash', $urlHash)->exists()) {
-            return null;
+            return;
         }
 
-        return CrawlQueue::create([
+        // insertOrIgnore silently skips the row if url_hash already exists
+        // (unique index) instead of throwing a duplicate-key exception —
+        // safe under many concurrent workers racing to enqueue the same link.
+        CrawlQueue::query()->insertOrIgnore([[
             'domain_id' => $domain->id,
             'url' => $url,
             'url_hash' => $urlHash,
             'priority' => $priority,
             'depth' => $depth,
             'status' => 'pending',
-        ]);
+            'attempts' => 0,
+            'max_attempts' => 3,
+            'created_at' => now(),
+            'updated_at' => now(),
+        ]]);
     }
 
     /**
@@ -156,12 +159,104 @@ class CrawlManager
             $item->update(['status' => 'processing', 'last_attempt_at' => now(), 'attempts' => $item->attempts + 1]);
         }
 
+        $domain = $this->prepareDomainForItem($item);
+
+        if (! $domain) {
+            return false;
+        }
+
+        $result = $this->crawler->fetch($item->url, $domain->crawl_delay_ms ?? config('crawler.crawl_delay_ms', 200));
+
+        return $this->applyFetchResult($item, $domain, $result);
+    }
+
+    /**
+     * Atomically claim up to $batchSize pending items for concurrent fetching.
+     *
+     * @return CrawlQueue[]
+     */
+    public function claimBatch(string $workerId, int $batchSize): array
+    {
+        $items = [];
+
+        for ($i = 0; $i < $batchSize; $i++) {
+            $item = $this->claimNext($workerId);
+
+            if (! $item) {
+                break;
+            }
+
+            $items[] = $item;
+        }
+
+        return $items;
+    }
+
+    /**
+     * Fetch a batch of claimed items concurrently (bounded by
+     * crawler.fetch_concurrency) and process each result as it completes.
+     *
+     * @param  CrawlQueue[]  $items
+     */
+    public function processBatch(array $items): void
+    {
+        $domains = [];
+        $urlDelayPairs = [];
+        $itemsByUrl = [];
+
+        foreach ($items as $item) {
+            try {
+                $domain = $this->prepareDomainForItem($item);
+            } catch (\Throwable $e) {
+                $item->update(['status' => 'failed', 'locked_by' => null]);
+
+                continue;
+            }
+
+            if (! $domain) {
+                continue;
+            }
+
+            $domains[$item->id] = $domain;
+            $urlDelayPairs[$item->url] = $domain->crawl_delay_ms ?? config('crawler.crawl_delay_ms', 200);
+            $itemsByUrl[$item->url] = $item;
+        }
+
+        if ($urlDelayPairs === []) {
+            return;
+        }
+
+        $results = $this->crawler->fetchConcurrently($urlDelayPairs);
+
+        foreach ($itemsByUrl as $url => $item) {
+            try {
+                $this->applyFetchResult($item, $domains[$item->id], $results[$url] ?? [
+                    'status' => null,
+                    'body' => null,
+                    'response_time_ms' => null,
+                    'content_type' => null,
+                    'error' => 'No result returned from pool',
+                    'skipped_reason' => null,
+                ]);
+            } catch (\Throwable $e) {
+                $item->update(['status' => 'failed', 'locked_by' => null]);
+                Log::warning("Failed processing {$url}: ".$e->getMessage());
+            }
+        }
+    }
+
+    /**
+     * Ensure the item's domain is active and allowed by robots.txt. Marks the
+     * item failed and returns null when it can't be crawled.
+     */
+    protected function prepareDomainForItem(CrawlQueue $item): ?Domain
+    {
         $domain = $item->domain;
 
         if (! $domain || $domain->status !== 'active') {
             $item->update(['status' => 'failed', 'locked_by' => null]);
 
-            return false;
+            return null;
         }
 
         if (! $domain->robots_checked) {
@@ -172,11 +267,14 @@ class CrawlManager
             $item->update(['status' => 'failed', 'locked_by' => null]);
             $this->log($domain, null, $item->url, null, null, null, 'Blocked by robots.txt');
 
-            return false;
+            return null;
         }
 
-        $result = $this->crawler->fetch($item->url, $domain->crawl_delay_ms ?? config('crawler.crawl_delay_ms', 500));
+        return $domain;
+    }
 
+    protected function applyFetchResult(CrawlQueue $item, Domain $domain, array $result): bool
+    {
         if ($result['error'] !== null || $result['status'] === null) {
             return $this->handleFailure($item, $domain, $result);
         }
@@ -195,6 +293,13 @@ class CrawlManager
         }
 
         $parsed = $this->parser->parse($result['body'] ?? '', $item->url);
+
+        if (mb_strlen(trim($parsed['content_text'] ?? '')) < config('crawler.min_content_chars', 100)) {
+            $item->update(['status' => 'done', 'locked_by' => null]);
+            $this->log($domain, null, $item->url, $result['status'], $result['response_time_ms'], null, 'Skipped: content too short');
+
+            return true;
+        }
 
         $page = $this->savePage($domain, $item, $result, $parsed);
 

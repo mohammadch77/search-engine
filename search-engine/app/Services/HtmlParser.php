@@ -72,6 +72,19 @@ class HtmlParser
         return $content !== '' ? $content : null;
     }
 
+    /**
+     * Block-level elements after which a line break must be inserted so that
+     * text from adjacent elements doesn't run together (e.g. "</p><p>" would
+     * otherwise yield "wordword" instead of "word word") when textContent
+     * flattens the DOM.
+     */
+    protected const BLOCK_TAGS = [
+        'p', 'div', 'br', 'hr', 'li', 'ul', 'ol', 'tr', 'td', 'th', 'table',
+        'section', 'article', 'header', 'footer', 'nav', 'aside', 'main',
+        'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'blockquote', 'pre', 'form',
+        'figure', 'figcaption', 'dl', 'dt', 'dd', 'address',
+    ];
+
     protected function extractText(DOMDocument $dom, DOMXPath $xpath): string
     {
         foreach ($xpath->query('//script|//style|//noscript') as $node) {
@@ -84,11 +97,21 @@ class HtmlParser
             return '';
         }
 
+        foreach ($xpath->query("//*[self::{$this->buildBlockXPath()}]") as $node) {
+            $node->parentNode?->insertBefore($dom->createTextNode("\n"), $node->nextSibling);
+        }
+
         $text = $body->textContent;
         $text = preg_replace('/[ \t\x0B\f\r]+/u', ' ', $text) ?? $text;
+        $text = preg_replace('/ *\n *\n*/u', "\n", $text) ?? $text;
         $text = preg_replace('/\n\s*\n+/u', "\n", $text) ?? $text;
 
         return trim($text);
+    }
+
+    protected function buildBlockXPath(): string
+    {
+        return implode(' or self::', self::BLOCK_TAGS);
     }
 
     protected function detectLanguage(DOMXPath $xpath, string $text): ?string

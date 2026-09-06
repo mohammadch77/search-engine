@@ -10,6 +10,7 @@ class CrawlWork extends Command
     protected $signature = 'crawl:work
         {--limit=0 : Stop after processing this many items (0 = run until queue is empty or killed)}
         {--sleep=2 : Seconds to sleep between polls when the queue is empty}
+        {--batch= : URLs fetched concurrently per iteration (defaults to config(crawler.fetch_concurrency))}
         {--id= : Worker identifier used for row locking/logging (defaults to the OS process id)}';
 
     protected $description = 'Continuously claim and process crawl queue items (one worker process)';
@@ -21,6 +22,7 @@ class CrawlWork extends Command
         $workerId = $this->option('id') ?: ('pid-'.getmypid());
         $limit = (int) $this->option('limit');
         $sleep = max(0, (int) $this->option('sleep'));
+        $batchSize = max(1, (int) ($this->option('batch') ?: config('crawler.fetch_concurrency', 5)));
 
         if (function_exists('pcntl_signal')) {
             pcntl_async_signals(true);
@@ -37,22 +39,25 @@ class CrawlWork extends Command
                 break;
             }
 
-            $item = $manager->claimNext($workerId);
+            $wanted = $limit > 0 ? min($batchSize, $limit - $processed) : $batchSize;
+            $items = $manager->claimBatch($workerId, $wanted);
 
-            if (! $item) {
+            if ($items === []) {
                 sleep($sleep);
 
                 continue;
             }
 
             try {
-                $manager->processQueueItem($item, alreadyClaimed: true);
+                $manager->processBatch($items);
             } catch (\Throwable $e) {
-                $item->update(['status' => 'failed', 'locked_by' => null]);
-                $this->error("[{$workerId}] {$item->url}: ".$e->getMessage());
+                foreach ($items as $item) {
+                    $item->update(['status' => 'failed', 'locked_by' => null]);
+                }
+                $this->error("[{$workerId}] batch failed: ".$e->getMessage());
             }
 
-            $processed++;
+            $processed += count($items);
         }
 
         $this->info("[{$workerId}] worker stopped after processing {$processed} items");
