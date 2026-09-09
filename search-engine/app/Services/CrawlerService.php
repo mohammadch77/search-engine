@@ -70,6 +70,7 @@ class CrawlerService
                 'body' => null,
                 'response_time_ms' => (int) round((microtime(true) - $start) * 1000),
                 'content_type' => null,
+                'headers' => null,
                 'error' => $e->getMessage(),
                 'skipped_reason' => null,
             ];
@@ -119,6 +120,7 @@ class CrawlerService
                     'body' => null,
                     'response_time_ms' => (int) round((microtime(true) - ($starts[$url] ?? microtime(true))) * 1000),
                     'content_type' => null,
+                    'headers' => null,
                     'error' => $reason instanceof \Throwable ? $reason->getMessage() : (string) $reason,
                     'skipped_reason' => null,
                 ];
@@ -138,6 +140,7 @@ class CrawlerService
     {
         $responseTimeMs = (int) round((microtime(true) - $start) * 1000);
         $contentType = $response->getHeaderLine('Content-Type');
+        $headers = $this->serializeHeaders($response);
 
         if ($contentType !== '' && ! $this->isAllowedContentType($contentType)) {
             return [
@@ -145,6 +148,7 @@ class CrawlerService
                 'body' => null,
                 'response_time_ms' => $responseTimeMs,
                 'content_type' => $contentType,
+                'headers' => $headers,
                 'error' => null,
                 'skipped_reason' => 'non_html_content_type',
             ];
@@ -157,6 +161,7 @@ class CrawlerService
                 'body' => null,
                 'response_time_ms' => $responseTimeMs,
                 'content_type' => $contentType,
+                'headers' => $headers,
                 'error' => null,
                 'skipped_reason' => 'too_large',
             ];
@@ -170,6 +175,7 @@ class CrawlerService
                 'body' => null,
                 'response_time_ms' => $responseTimeMs,
                 'content_type' => $contentType,
+                'headers' => $headers,
                 'error' => null,
                 'skipped_reason' => 'too_large',
             ];
@@ -180,9 +186,22 @@ class CrawlerService
             'body' => $body,
             'response_time_ms' => $responseTimeMs,
             'content_type' => $contentType ?: null,
+            'headers' => $headers,
             'error' => null,
             'skipped_reason' => null,
         ];
+    }
+
+    /**
+     * Compact JSON representation of response headers, truncated so a
+     * pathological server can't bloat the raw_pages.headers column.
+     */
+    protected function serializeHeaders(ResponseInterface $response): string
+    {
+        $flat = array_map(fn (array $values) => implode(', ', $values), $response->getHeaders());
+        $json = json_encode($flat, JSON_UNESCAPED_SLASHES);
+
+        return $json !== false ? mb_substr($json, 0, 4000) : '';
     }
 
     protected function isAllowedContentType(string $contentType): bool

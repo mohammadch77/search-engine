@@ -5,6 +5,7 @@ namespace App\Console\Commands;
 use App\Models\CrawlQueue;
 use App\Models\Domain;
 use App\Models\Page;
+use App\Models\RawPage;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\DB;
 
@@ -27,13 +28,19 @@ class CrawlMonitor extends Command
         }
 
         $lastCount = Page::count();
+        $lastFetched = RawPage::count();
+        $lastProcessed = RawPage::where('processed', true)->count();
         $lastAt = microtime(true);
 
         while (! $this->shouldStop) {
             $pagesTotal = Page::count();
+            $fetchedTotal = RawPage::count();
+            $processedTotal = RawPage::where('processed', true)->count();
             $now = microtime(true);
             $elapsedMin = max(($now - $lastAt) / 60, 1 / 60);
             $rate = ($pagesTotal - $lastCount) / $elapsedMin;
+            $fetchRate = ($fetchedTotal - $lastFetched) / $elapsedMin;
+            $processRate = ($processedTotal - $lastProcessed) / $elapsedMin;
 
             $queuePending = CrawlQueue::where('status', 'pending')->count();
             $queueProcessing = CrawlQueue::where('status', 'processing')->count();
@@ -48,7 +55,12 @@ class CrawlMonitor extends Command
             $this->table(['Metric', 'Value'], [
                 ['Pages crawled (total)', number_format($pagesTotal)],
                 ['Pages / minute', number_format($rate, 1)],
-                ['Queue: pending', number_format($queuePending)],
+                ['Fetched (raw_pages total)', number_format($fetchedTotal)],
+                ['Fetch rate (pages/min)', number_format($fetchRate, 1)],
+                ['Processed (raw_pages done)', number_format($processedTotal)],
+                ['Process rate (pages/min)', number_format($processRate, 1)],
+                ['Unprocessed backlog', number_format($fetchedTotal - $processedTotal)],
+                ['Queue size (pending)', number_format($queuePending)],
                 ['Queue: processing', number_format($queueProcessing)],
                 ['Domains discovered', number_format($domains)],
                 ['Target', number_format($target)],
@@ -57,6 +69,8 @@ class CrawlMonitor extends Command
             ]);
 
             $lastCount = $pagesTotal;
+            $lastFetched = $fetchedTotal;
+            $lastProcessed = $processedTotal;
             $lastAt = $now;
 
             sleep($interval);

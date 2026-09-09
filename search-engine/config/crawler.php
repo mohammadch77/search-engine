@@ -47,4 +47,12 @@ return [
 
     // Auto-pause a domain once its recent error rate exceeds this fraction.
     'error_rate_pause_threshold' => (float) env('CRAWLER_ERROR_RATE_PAUSE_THRESHOLD', 0.5),
+
+    // Pipeline 2 (crawl:process): give up on a raw_pages row after this many
+    // failed parse attempts instead of retrying it forever.
+    'processor_max_attempts' => (int) env('CRAWLER_PROCESSOR_MAX_ATTEMPTS', 3),
+
+    // Default worker counts for the two-pipeline crawler (crawl:start).
+    'fetch_workers' => (int) env('CRAWLER_FETCH_WORKERS', 15),
+    'process_workers' => (int) env('CRAWLER_PROCESS_WORKERS', 5),
 ];

@@ -7,6 +7,7 @@ use App\Models\CrawlQueue;
 use App\Models\Domain;
 use App\Models\Link;
 use App\Models\Page;
+use App\Models\RawPage;
 use Illuminate\Database\QueryException;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
@@ -14,21 +15,12 @@ use Illuminate\Support\Facades\Log;
 
 class CrawlManager
 {
-    /**
-     * Common phrases found on "soft 404" pages — real HTTP 200 responses
-     * whose content is actually a generic not-found/error page.
-     */
-    protected const SOFT_404_PHRASES = [
-        'صفحه مورد نظر یافت نشد', 'صفحه یافت نشد', 'یافت نشد',
-        'page not found', 'not found', '404 error', 'page does not exist',
-        'this page doesn\'t exist', 'content not found',
-    ];
-
     public function __construct(
         protected CrawlerService $crawler,
         protected HtmlParser $parser,
         protected RobotsTxtParser $robots,
         protected UrlNormalizer $normalizer,
+        protected ContentQualityChecker $qualityChecker,
     ) {
     }
 
@@ -117,7 +109,11 @@ class CrawlManager
         });
     }
 
-    protected function enqueueUrl(Domain $domain, string $url, int $depth, int $priority = 0): void
+    /**
+     * Public so PageProcessor (pipeline 2) can enqueue links it discovers
+     * while parsing raw_pages without duplicating this logic.
+     */
+    public function enqueueUrl(Domain $domain, string $url, int $depth, int $priority = 0): void
     {
         $url = $this->normalizer->normalize($url);
 
@@ -305,6 +301,104 @@ class CrawlManager
     }
 
     /**
+     * Pipeline 1 (fetch-only): fetch a batch of claimed items concurrently and
+     * store the raw HTML in raw_pages without parsing/indexing. Mirrors
+     * processBatch() but skips everything CPU-bound so IO-bound fetch workers
+     * never wait on parsing or FULLTEXT index writes.
+     *
+     * @param  CrawlQueue[]  $items
+     */
+    public function fetchBatchOnly(array $items): void
+    {
+        $domains = [];
+        $urlDelayPairs = [];
+        $itemsByUrl = [];
+
+        foreach ($items as $item) {
+            try {
+                $domain = $this->prepareDomainForItem($item);
+            } catch (\Throwable $e) {
+                $item->update(['status' => 'failed', 'locked_by' => null]);
+
+                continue;
+            }
+
+            if (! $domain) {
+                continue;
+            }
+
+            $domains[$item->id] = $domain;
+            $urlDelayPairs[$item->url] = $domain->crawl_delay_ms ?? config('crawler.crawl_delay_ms', 200);
+            $itemsByUrl[$item->url] = $item;
+        }
+
+        if ($urlDelayPairs === []) {
+            return;
+        }
+
+        $results = $this->crawler->fetchConcurrently($urlDelayPairs);
+
+        foreach ($itemsByUrl as $url => $item) {
+            try {
+                $this->applyFetchOnlyResult($item, $domains[$item->id], $results[$url] ?? [
+                    'status' => null,
+                    'body' => null,
+                    'response_time_ms' => null,
+                    'content_type' => null,
+                    'headers' => null,
+                    'error' => 'No result returned from pool',
+                    'skipped_reason' => null,
+                ]);
+            } catch (\Throwable $e) {
+                $item->update(['status' => 'failed', 'locked_by' => null]);
+                Log::warning("Failed fetching {$url}: ".$e->getMessage());
+            }
+        }
+    }
+
+    protected function applyFetchOnlyResult(CrawlQueue $item, Domain $domain, array $result): bool
+    {
+        if ($result['error'] !== null || $result['status'] === null) {
+            return $this->handleFailure($item, $domain, $result);
+        }
+
+        if ($result['status'] >= 400) {
+            $this->log($domain, null, $item->url, $result['status'], $result['response_time_ms'], null, "HTTP {$result['status']}");
+
+            return $this->handleFailure($item, $domain, $result);
+        }
+
+        if ($result['skipped_reason'] !== null) {
+            $item->update(['status' => 'done', 'locked_by' => null]);
+            $this->log($domain, null, $item->url, $result['status'], $result['response_time_ms'], null, 'Skipped: '.$result['skipped_reason']);
+
+            return true;
+        }
+
+        RawPage::updateOrCreate(
+            ['url_hash' => $item->url_hash],
+            [
+                'domain_id' => $domain->id,
+                'url' => $item->url,
+                'depth' => $item->depth,
+                'html_content' => $result['body'],
+                'http_status' => $result['status'],
+                'content_type' => $result['content_type'],
+                'headers' => $result['headers'] ?? null,
+                'fetched_at' => now(),
+                'processed' => false,
+                'locked_by' => null,
+                'attempts' => 0,
+            ]
+        );
+
+        $item->update(['status' => 'done', 'locked_by' => null]);
+        $this->log($domain, null, $item->url, $result['status'], $result['response_time_ms'], strlen($result['body'] ?? ''), null);
+
+        return true;
+    }
+
+    /**
      * Ensure the item's domain is active and allowed by robots.txt. Marks the
      * item failed and returns null when it can't be crawled.
      */
@@ -353,45 +447,54 @@ class CrawlManager
 
         $parsed = $this->parser->parse($result['body'] ?? '', $item->url);
 
-        if (mb_strlen(trim($parsed['content_text'] ?? '')) < config('crawler.min_content_chars', 100)) {
-            $item->update(['status' => 'done', 'locked_by' => null]);
-            $this->log($domain, null, $item->url, $result['status'], $result['response_time_ms'], null, 'Skipped: content too short');
+        $outcome = $this->indexParsedPage(
+            $domain, $item->url, $item->url_hash, $item->depth,
+            $result['status'], $result['content_type'], $result['body'] ?? '', $parsed
+        );
 
-            return true;
+        $item->update(['status' => 'done', 'locked_by' => null]);
+        $this->log($domain, $outcome['page'], $item->url, $result['status'], $result['response_time_ms'],
+            $outcome['page'] ? strlen($result['body'] ?? '') : null,
+            $outcome['page'] ? null : 'Skipped: '.$outcome['reason']);
+
+        return true;
+    }
+
+    /**
+     * Parse-and-save step shared by the single-pipeline crawl (fetch+parse in
+     * one worker) and the pipeline-2 processor (parses previously-fetched
+     * raw_pages rows). Applies min-length, soft-404, and content-dedup checks,
+     * then saves the page, its links, and enqueues newly-discovered URLs.
+     *
+     * @return array{reason: ?string, page: ?Page}
+     */
+    public function indexParsedPage(Domain $domain, string $url, string $urlHash, int $depth, ?int $httpStatus, ?string $contentType, ?string $rawBody, array $parsed): array
+    {
+        if (mb_strlen(trim($parsed['content_text'] ?? '')) < config('crawler.min_content_chars', 100)) {
+            return ['reason' => 'content too short', 'page' => null];
         }
 
-        if ($this->isSoft404($parsed)) {
-            $item->update(['status' => 'done', 'locked_by' => null]);
-            $this->log($domain, null, $item->url, $result['status'], $result['response_time_ms'], null, 'Skipped: soft 404');
-
-            return true;
+        if ($this->qualityChecker->isSoft404($parsed)) {
+            return ['reason' => 'soft 404', 'page' => null];
         }
 
         $contentHash = hash('sha256', $parsed['content_text']);
-        $urlHash = $item->url_hash;
         $duplicate = Page::where('content_hash', $contentHash)->where('url_hash', '!=', $urlHash)->exists();
 
         if ($duplicate) {
-            $item->update(['status' => 'done', 'locked_by' => null]);
-            $this->log($domain, null, $item->url, $result['status'], $result['response_time_ms'], null, 'Skipped: duplicate content');
-
-            return true;
+            return ['reason' => 'duplicate content', 'page' => null];
         }
 
-        $page = $this->savePage($domain, $item, $result, $parsed, $contentHash);
+        $page = $this->savePage($domain, $url, $urlHash, $depth, $httpStatus, $contentType, $rawBody, $parsed, $contentHash);
 
-        $this->saveLinks($domain, $page, $item, $parsed['links']);
+        $this->saveLinks($domain, $page, $depth, $parsed['links']);
 
         $domain->increment('pages_count');
         $domain->update(['last_crawled_at' => now()]);
 
-        $item->update(['status' => 'done', 'locked_by' => null]);
-
-        $this->log($domain, $page, $item->url, $result['status'], $result['response_time_ms'], strlen($result['body'] ?? ''), null);
-
         $this->invalidateSearchCaches();
 
-        return true;
+        return ['reason' => null, 'page' => $page];
     }
 
     protected function invalidateSearchCaches(): void
@@ -445,43 +548,24 @@ class CrawlManager
         }
     }
 
-    /**
-     * True if the fetched page returns HTTP 200 but its content is actually a
-     * generic "not found" page — a common cause of wasted crawl/index space.
-     */
-    protected function isSoft404(array $parsed): bool
+    protected function savePage(Domain $domain, string $url, string $urlHash, int $depth, ?int $httpStatus, ?string $contentType, ?string $rawBody, array $parsed, string $contentHash): Page
     {
-        $haystack = mb_strtolower(($parsed['title'] ?? '').' '.mb_substr($parsed['content_text'] ?? '', 0, 500));
-
-        foreach (self::SOFT_404_PHRASES as $phrase) {
-            if (mb_strpos($haystack, mb_strtolower($phrase)) !== false) {
-                return true;
-            }
-        }
-
-        return false;
-    }
-
-    protected function savePage(Domain $domain, CrawlQueue $item, array $result, array $parsed, string $contentHash): Page
-    {
-        $urlHash = $item->url_hash;
-
         return Page::updateOrCreate(
             ['url_hash' => $urlHash],
             [
                 'domain_id' => $domain->id,
-                'url' => $item->url,
+                'url' => $url,
                 'title' => $parsed['title'] ? mb_substr($parsed['title'], 0, 500) : null,
                 'meta_description' => $parsed['meta_description'],
                 'meta_keywords' => $parsed['meta_keywords'],
-                'content_raw' => config('crawler.store_raw_html', false) ? $result['body'] : null,
+                'content_raw' => config('crawler.store_raw_html', false) ? $rawBody : null,
                 'content_text' => $parsed['content_text'],
                 'content_hash' => $contentHash,
-                'http_status' => $result['status'],
-                'content_type' => $result['content_type'],
+                'http_status' => $httpStatus,
+                'content_type' => $contentType,
                 'language' => $parsed['language'],
                 'word_count' => $parsed['word_count'],
-                'depth' => $item->depth,
+                'depth' => $depth,
                 'status' => 'indexed',
                 'crawled_at' => now(),
                 'indexed_at' => now(),
@@ -489,7 +573,11 @@ class CrawlManager
         );
     }
 
-    protected function saveLinks(Domain $domain, Page $page, CrawlQueue $item, array $links): void
+    /**
+     * Public so PageProcessor (pipeline 2) can save discovered links and
+     * enqueue new URLs the same way the single-pipeline crawler does.
+     */
+    public function saveLinks(Domain $domain, Page $page, int $depth, array $links): void
     {
         $discoveriesLeft = 5; // cap new domains per page so one link-heavy page can't stall a worker
 
@@ -505,8 +593,8 @@ class CrawlManager
                 'is_external' => $link['is_external'],
             ]);
 
-            if (! $link['is_external'] && $item->depth < $domain->max_depth) {
-                $this->enqueueUrl($domain, $link['url'], $item->depth + 1);
+            if (! $link['is_external'] && $depth < $domain->max_depth) {
+                $this->enqueueUrl($domain, $link['url'], $depth + 1);
 
                 continue;
             }
