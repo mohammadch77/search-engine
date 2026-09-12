@@ -32,6 +32,7 @@ class Page extends Model
         'status',
         'crawled_at',
         'indexed_at',
+        'has_product',
     ];
 
     protected $casts = [
@@ -41,6 +42,7 @@ class Page extends Model
         'page_rank' => 'float',
         'crawled_at' => 'datetime',
         'indexed_at' => 'datetime',
+        'has_product' => 'boolean',
     ];
 
     public function domain(): BelongsTo

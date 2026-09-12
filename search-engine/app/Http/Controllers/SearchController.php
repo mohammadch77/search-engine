@@ -3,6 +3,7 @@
 namespace App\Http\Controllers;
 
 use App\Models\Domain;
+use App\Services\ProductSearchService;
 use App\Services\SearchService;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
@@ -10,8 +11,10 @@ use Illuminate\Support\Facades\Cache;
 
 class SearchController extends Controller
 {
-    public function __construct(protected SearchService $searchService)
-    {
+    public function __construct(
+        protected SearchService $searchService,
+        protected ProductSearchService $productSearchService,
+    ) {
     }
 
     public function search(Request $request): JsonResponse
@@ -38,7 +41,26 @@ class SearchController extends Controller
             (int) ($validated['page'] ?? 1)
         );
 
+        $result['products'] = $this->productSearchService->search($validated['q']);
+
         return response()->json($result);
+    }
+
+    public function searchProducts(Request $request): JsonResponse
+    {
+        $validated = $request->validate([
+            'q' => ['required', 'string', 'max:500'],
+            'sort' => ['nullable', 'string', 'in:price_asc,price_desc'],
+        ]);
+
+        $products = $this->productSearchService->search($validated['q'], $validated['sort'] ?? 'price_asc');
+
+        return response()->json(['products' => $products]);
+    }
+
+    public function productPrices(int $product): JsonResponse
+    {
+        return response()->json(['prices' => $this->productSearchService->pricesForProduct($product)]);
     }
 
     public function suggest(Request $request): JsonResponse

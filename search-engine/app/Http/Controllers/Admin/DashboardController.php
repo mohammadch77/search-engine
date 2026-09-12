@@ -7,6 +7,8 @@ use App\Models\CrawlLog;
 use App\Models\CrawlQueue;
 use App\Models\Domain;
 use App\Models\Page;
+use App\Models\Product;
+use App\Models\ProductPrice;
 use App\Models\SearchLog;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
@@ -57,8 +59,38 @@ class DashboardController extends Controller
                 ],
                 'searches_today' => SearchLog::whereDate('searched_at', today())->count(),
                 'crawl_speed_per_hour' => $lastHourPages,
+                'total_products' => Product::count(),
+                'total_prices_tracked' => ProductPrice::count(),
+                'products_per_domain' => $this->productsPerDomain(),
+                'price_extraction_success_rate' => $this->priceExtractionSuccessRate(),
             ];
         });
+    }
+
+    /**
+     * Best-effort: pages with has_product=true count as "successful
+     * extractions"; pages with a http status (i.e. actually fetched and
+     * parsed) count as "attempted", since there's no separate log of every
+     * extraction attempt.
+     */
+    protected function priceExtractionSuccessRate(): float
+    {
+        $attempted = Page::whereNotNull('http_status')->count();
+        $succeeded = Page::where('has_product', true)->count();
+
+        return $attempted > 0 ? round($succeeded / $attempted, 4) : 0.0;
+    }
+
+    protected function productsPerDomain(): array
+    {
+        return ProductPrice::query()
+            ->join('domains', 'domains.id', '=', 'product_prices.domain_id')
+            ->select('domains.name as domain', DB::raw('COUNT(DISTINCT product_prices.product_id) as products_count'))
+            ->groupBy('domains.name')
+            ->orderByDesc('products_count')
+            ->get()
+            ->map(fn ($row) => ['domain' => $row->domain, 'products_count' => (int) $row->products_count])
+            ->all();
     }
 
     protected function getPagesPerDay(): array

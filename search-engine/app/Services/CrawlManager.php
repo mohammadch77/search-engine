@@ -7,6 +7,8 @@ use App\Models\CrawlQueue;
 use App\Models\Domain;
 use App\Models\Link;
 use App\Models\Page;
+use App\Models\PriceHistory;
+use App\Models\ProductPrice;
 use App\Models\RawPage;
 use Illuminate\Database\QueryException;
 use Illuminate\Support\Facades\Cache;
@@ -15,12 +17,29 @@ use Illuminate\Support\Facades\Log;
 
 class CrawlManager
 {
+    /**
+     * Known Iranian e-commerce domains seeded by crawl:seed. Used by the
+     * iran-only crawl mode and by the product-path priority/skip heuristics
+     * regardless of whether the domain itself ends in .ir.
+     */
+    public const IRANIAN_ECOMMERCE_DOMAINS = [
+        'digikala.com', 'torob.com', 'basalam.com', 'emalls.ir', 'mobit.ir',
+        'mobile.ir', 'technolife.ir', 'netbarg.com', 'zanbil.ir', 'banimode.com',
+        'snappmarket.com', 'okala.com',
+    ];
+
+    protected const SKIP_PATH_SEGMENTS = ['/blog/', '/about/', '/help/', '/faq/', '/terms/', '/privacy/', '/login/', '/cart/'];
+
+    protected const PRODUCT_PATH_SEGMENTS = ['/product/', '/p/', '/dp/'];
+
     public function __construct(
         protected CrawlerService $crawler,
         protected HtmlParser $parser,
         protected RobotsTxtParser $robots,
         protected UrlNormalizer $normalizer,
         protected ContentQualityChecker $qualityChecker,
+        protected PriceExtractor $priceExtractor,
+        protected ProductMatcher $productMatcher,
     ) {
     }
 
@@ -47,7 +66,7 @@ class CrawlManager
                 [
                     'base_url' => $baseUrl,
                     'status' => 'active',
-                    'max_depth' => config('crawler.max_depth', 10),
+                    'max_depth' => $this->isEcommerceDomain($url) ? 15 : config('crawler.max_depth', 10),
                     'crawl_delay_ms' => config('crawler.crawl_delay_ms', 200),
                 ]
             );
@@ -121,6 +140,14 @@ class CrawlManager
             return;
         }
 
+        if (! $this->passesIranOnlyFilter($url)) {
+            return;
+        }
+
+        if ($this->isEcommerceDomain($url) && $this->looksLikeNonProductPage($url)) {
+            return;
+        }
+
         $urlHash = hash('sha256', $url);
 
         if (Page::where('url_hash', $urlHash)->exists()) {
@@ -159,8 +186,63 @@ class CrawlManager
     {
         $depthBoost = max(0, 5 - $depth);
         $lengthBoost = strlen($url) < 60 ? 2 : (strlen($url) < 120 ? 1 : 0);
+        $productBoost = $this->looksLikeProductPage($url) ? 10 : 0;
 
-        return $depthBoost + $lengthBoost;
+        return $depthBoost + $lengthBoost + $productBoost;
+    }
+
+    protected function passesIranOnlyFilter(string $url): bool
+    {
+        if (! config('crawler.iran_only', false)) {
+            return true;
+        }
+
+        $host = parse_url($url, PHP_URL_HOST) ?: '';
+
+        return str_ends_with($host, '.ir') || $this->isEcommerceDomain($url);
+    }
+
+    protected function isEcommerceDomain(string $url): bool
+    {
+        $host = preg_replace('/^www\./', '', (string) parse_url($url, PHP_URL_HOST));
+
+        foreach (self::IRANIAN_ECOMMERCE_DOMAINS as $domain) {
+            if ($host === $domain || str_ends_with($host, '.'.$domain)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    protected function looksLikeProductPage(string $url): bool
+    {
+        $path = (string) parse_url($url, PHP_URL_PATH);
+
+        foreach (self::PRODUCT_PATH_SEGMENTS as $segment) {
+            if (str_contains($path, $segment)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    protected function looksLikeNonProductPage(string $url): bool
+    {
+        if ($this->looksLikeProductPage($url)) {
+            return false;
+        }
+
+        $path = (string) parse_url($url, PHP_URL_PATH);
+
+        foreach (self::SKIP_PATH_SEGMENTS as $segment) {
+            if (str_contains($path, $segment)) {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     /**
@@ -489,12 +571,65 @@ class CrawlManager
 
         $this->saveLinks($domain, $page, $depth, $parsed['links']);
 
+        $this->extractAndSaveProductPrice($domain, $page, $url, $rawBody);
+
         $domain->increment('pages_count');
         $domain->update(['last_crawled_at' => now()]);
 
         $this->invalidateSearchCaches();
 
         return ['reason' => null, 'page' => $page];
+    }
+
+    /**
+     * Best-effort product/price extraction, run only for known e-commerce
+     * domains so it doesn't waste work on ordinary crawled pages.
+     */
+    protected function extractAndSaveProductPrice(Domain $domain, Page $page, string $url, ?string $rawBody): void
+    {
+        if ($rawBody === null || ! $this->isEcommerceDomain($url)) {
+            return;
+        }
+
+        $extracted = $this->priceExtractor->extract($rawBody, $url, $domain->name);
+
+        if ($extracted === null) {
+            return;
+        }
+
+        $product = $this->productMatcher->match($extracted['product_name'], imageUrl: $extracted['image_url']);
+
+        $priceFormatted = $this->formatTomanPrice((int) round($extracted['price'] / 10));
+
+        $productPrice = ProductPrice::updateOrCreate(
+            ['product_id' => $product->id, 'page_id' => $page->id],
+            [
+                'domain_id' => $domain->id,
+                'price' => $extracted['price'],
+                'price_formatted' => $priceFormatted,
+                'currency' => $extracted['currency'],
+                'availability' => $extracted['availability'],
+                'product_url' => $url,
+                'extracted_at' => now(),
+            ]
+        );
+
+        PriceHistory::create([
+            'product_price_id' => $productPrice->id,
+            'price' => $extracted['price'],
+            'recorded_at' => now(),
+        ]);
+
+        $page->update(['has_product' => true]);
+    }
+
+    protected function formatTomanPrice(int $toman): string
+    {
+        $persianDigits = ['۰', '۱', '۲', '۳', '۴', '۵', '۶', '۷', '۸', '۹'];
+        $formatted = number_format($toman);
+        $formatted = strtr($formatted, ['0' => $persianDigits[0], '1' => $persianDigits[1], '2' => $persianDigits[2], '3' => $persianDigits[3], '4' => $persianDigits[4], '5' => $persianDigits[5], '6' => $persianDigits[6], '7' => $persianDigits[7], '8' => $persianDigits[8], '9' => $persianDigits[9]]);
+
+        return $formatted.' تومان';
     }
 
     protected function invalidateSearchCaches(): void

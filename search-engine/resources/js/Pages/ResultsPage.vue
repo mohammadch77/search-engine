@@ -6,6 +6,7 @@ import SearchLogo from '@/Components/SearchLogo.vue';
 import Filters from '@/Components/Filters.vue';
 import ResultItem from '@/Components/ResultItem.vue';
 import Pagination from '@/Components/Pagination.vue';
+import ProductCard from '@/Components/ProductCard.vue';
 import { dirFor } from '@/utils/rtl';
 
 const query = ref('');
@@ -15,6 +16,7 @@ const sort = ref('relevance');
 const page = ref(1);
 
 const results = ref([]);
+const products = ref([]);
 const total = ref(0);
 const lastPage = ref(1);
 const timeTakenMs = ref(0);
@@ -73,12 +75,14 @@ async function runSearch({ resetPage = false, replace = false } = {}) {
         });
 
         results.value = data.results || [];
+        products.value = data.products || [];
         total.value = data.total || 0;
         lastPage.value = data.last_page || 1;
         timeTakenMs.value = data.time_taken_ms || 0;
         searched.value = true;
     } catch (e) {
         results.value = [];
+        products.value = [];
         searched.value = true;
     } finally {
         loading.value = false;
@@ -146,6 +150,13 @@ onMounted(() => {
             <div v-if="loading" class="py-10 text-center text-sm text-gray-400">در حال جستجو…</div>
 
             <template v-else-if="searched">
+                <section v-if="products.length > 0" class="mb-6">
+                    <h2 class="mb-3 text-sm font-semibold text-gray-700">محصولات</h2>
+                    <div class="space-y-3">
+                        <ProductCard v-for="p in products" :key="p.id" :product="p" />
+                    </div>
+                </section>
+
                 <div v-if="results.length === 0" class="py-16 text-center">
                     <p class="text-gray-600">هیچ نتیجه‌ای برای این جستجو پیدا نشد.</p>
                 </div>

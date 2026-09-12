@@ -3,6 +3,7 @@ import { computed } from 'vue';
 import AdminLayout from '@/Layouts/AdminLayout.vue';
 import StatCard from '@/Components/Admin/StatCard.vue';
 import LineChart from '@/Components/Admin/LineChart.vue';
+import BarChart from '@/Components/Admin/BarChart.vue';
 
 defineOptions({ layout: AdminLayout });
 
@@ -16,6 +17,10 @@ const pagesLabels = computed(() => props.pagesPerDay.map((r) => r.date));
 const pagesValues = computed(() => props.pagesPerDay.map((r) => r.count));
 const searchesLabels = computed(() => props.searchesPerDay.map((r) => r.date));
 const searchesValues = computed(() => props.searchesPerDay.map((r) => r.count));
+
+const domainLabels = computed(() => props.stats.products_per_domain.map((r) => r.domain));
+const domainValues = computed(() => props.stats.products_per_domain.map((r) => r.products_count));
+const extractionRatePct = computed(() => `${(props.stats.price_extraction_success_rate * 100).toFixed(1)}%`);
 </script>
 
 <template>
@@ -31,8 +36,11 @@ const searchesValues = computed(() => props.searchesPerDay.map((r) => r.count));
             <StatCard label="Searches Today" :value="stats.searches_today.toLocaleString()" />
         </div>
 
-        <div class="mb-8">
+        <div class="mb-8 grid grid-cols-2 gap-4 sm:grid-cols-4">
             <StatCard label="Crawl Speed (pages / last hour)" :value="stats.crawl_speed_per_hour.toLocaleString()" />
+            <StatCard label="Total Products" :value="stats.total_products.toLocaleString()" />
+            <StatCard label="Prices Tracked" :value="stats.total_prices_tracked.toLocaleString()" />
+            <StatCard label="Price Extraction Success Rate" :value="extractionRatePct" />
         </div>
 
         <div class="grid grid-cols-1 gap-6 lg:grid-cols-2">
@@ -44,6 +52,12 @@ const searchesValues = computed(() => props.searchesPerDay.map((r) => r.count));
             <div class="rounded-lg border border-gray-200 bg-white p-4">
                 <h2 class="mb-3 text-sm font-medium text-gray-700">Searches (last 30 days)</h2>
                 <LineChart :labels="searchesLabels" :values="searchesValues" label="Searches" color="#16a34a" />
+            </div>
+
+            <div class="rounded-lg border border-gray-200 bg-white p-4 lg:col-span-2">
+                <h2 class="mb-3 text-sm font-medium text-gray-700">Products per Domain</h2>
+                <BarChart v-if="domainLabels.length" :labels="domainLabels" :values="domainValues" label="Products" color="#7c3aed" />
+                <p v-else class="text-sm text-gray-500">No product data yet.</p>
             </div>
         </div>
     </div>

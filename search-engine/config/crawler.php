@@ -55,4 +55,8 @@ return [
     // Default worker counts for the two-pipeline crawler (crawl:start).
     'fetch_workers' => (int) env('CRAWLER_FETCH_WORKERS', 15),
     'process_workers' => (int) env('CRAWLER_PROCESS_WORKERS', 5),
+
+    // When true, only .ir domains and the known Iranian e-commerce domain
+    // list are enqueued/crawled (see CrawlManager::IRANIAN_ECOMMERCE_DOMAINS).
+    'iran_only' => filter_var(env('CRAWLER_IRAN_ONLY', false), FILTER_VALIDATE_BOOL),
 ];

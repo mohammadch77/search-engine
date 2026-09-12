@@ -4,6 +4,7 @@ import { Link, router } from '@inertiajs/vue3';
 const nav = [
     { label: 'Dashboard', href: '/admin' },
     { label: 'Domains', href: '/admin/domains' },
+    { label: 'Products', href: '/admin/products' },
     { label: 'Searches', href: '/admin/searches' },
 ];
 

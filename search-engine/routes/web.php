@@ -3,6 +3,7 @@
 use App\Http\Controllers\Admin\AuthController;
 use App\Http\Controllers\Admin\DashboardController;
 use App\Http\Controllers\Admin\DomainController;
+use App\Http\Controllers\Admin\ProductController;
 use App\Http\Controllers\Admin\SearchLogController;
 use Illuminate\Support\Facades\Route;
 use Inertia\Inertia;
@@ -28,5 +29,7 @@ Route::prefix('admin')->name('admin.')->group(function () {
         Route::post('/domains/{domain}/recrawl', [DomainController::class, 'recrawl'])->name('domains.recrawl');
         Route::delete('/domains/{domain}', [DomainController::class, 'destroy'])->name('domains.destroy');
         Route::get('/searches', [SearchLogController::class, 'index'])->name('searches');
+        Route::get('/products', [ProductController::class, 'index'])->name('products');
+        Route::get('/products/{product}', [ProductController::class, 'show'])->name('products.show');
     });
 });
